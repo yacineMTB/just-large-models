@@ -1,4 +1,5 @@
-# Why? I got a little annoyed w/ huggingface's.. code. So I ripped it out and fixed the over abstraction
+# Why? I got a little annoyed w/ huggingface's.. code. So I ripped it out and fixed some over abstraction
+# The end goal is to remove all dependencies from huggingface.
 # Still not completely unfucked!
 
 # Attribution:
@@ -51,107 +52,90 @@ question = [
 ]
 tokenizer.pad_token = tokenizer.eos_token
 
-def prepare_inputs_for_generation(
-    input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
-):
-    if past_key_values:
-        input_ids = input_ids[:, -1:]
-
-    position_ids = kwargs.get("position_ids", None)
-    if attention_mask is not None and position_ids is None:
-        # create position_ids on the fly for batch generation
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        if past_key_values:
-            position_ids = position_ids[:, -1].unsqueeze(-1)
-
-    # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-    if inputs_embeds is not None and past_key_values is None:
-        model_inputs = {"inputs_embeds": inputs_embeds}
-    else:
-        model_inputs = {"input_ids": input_ids}
-
-    model_inputs.update(
-        {
-            "position_ids": position_ids,
-            "past_key_values": past_key_values,
-            "use_cache": kwargs.get("use_cache"),
-            "attention_mask": attention_mask,
-        }
-    )
-    return model_inputs
 
 def generate(
-    model=None,
-    model_as_fn=None,
-    generation_config=None,
-    logits_processor=None,
-    **kwargs,
+    input_ids = None,
+    max_length = None,
+    attention_mask = None,
+    use_cache = None,
+    model_as_fn = None,
+    model = None,
 ):
     generation_config = model.generation_config
-    model_kwargs = kwargs.copy()
-    model_kwargs["use_cache"] = True
-    return greedy_search(
-        model,
-        model_as_fn,
-        logits_processor=logits_processor,
-        pad_token_id=generation_config.pad_token_id,
-        eos_token_id=generation_config.eos_token_id,
-        output_scores=generation_config.output_scores,
-        **model_kwargs,
-    )
 
-
-def greedy_search(
-    model,
-    model_as_fn,
-    input_ids,
-    max_length,
-    pad_token_id,
-    eos_token_id,
-    **model_kwargs,
-):
+    pad_token_id = generation_config.pad_token_id
+    eos_token_id = generation_config.eos_token_id
     eos_token_id_tensor = torch.tensor([eos_token_id]).to(input_ids.device)
+
+    # We want to mark sequences that are finished
     unfinished_sequences = torch.ones(
         input_ids.shape[0], dtype=torch.long, device=input_ids.device)
+
+    past_key_values = None
+    position_ids = None
+
     while True:
-        model_inputs = prepare_inputs_for_generation(input_ids, **model_kwargs)
+        # todo: This used to be worse, but its still bad. continue unfucking
+        if past_key_values:
+            inference_state = {"input_ids": input_ids[:, -1:]}
+        else:
+            inference_state = {"input_ids": input_ids}
+
+        if attention_mask is not None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -1].unsqueeze(-1)
+
+        inference_state.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": True,
+                "attention_mask": attention_mask,
+            }
+        )
+
         outputs = model_as_fn(
             model,
-            **model_inputs,
+            input_ids = inference_state['input_ids'],
+            position_ids = inference_state['position_ids'],
+            past_key_values = inference_state['past_key_values'],
+            use_cache = inference_state['use_cache'],
+            attention_mask = inference_state['attention_mask'],
         )
+
         next_token_logits = outputs.logits[:, -1, :]
         next_tokens = torch.argmax(next_token_logits, dim=-1)
+
         # finished sentences should have their next token be a padding token
         next_tokens = next_tokens * unfinished_sequences + \
             pad_token_id * (1 - unfinished_sequences)
+
         # update generated ids, model inputs, and length for next step
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-        model_kwargs['past_key_values'] = outputs.past_key_values
-        if getattr(outputs, "state", None) is not None:
-            model_kwargs["state"] = outputs.state
+        past_key_values = outputs.past_key_values
 
-        if "attention_mask" in model_kwargs:
-            attention_mask = model_kwargs["attention_mask"]
-            model_kwargs["attention_mask"] = torch.cat(
-                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
-            )
+        attention_mask = torch.cat(
+            [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+        )
 
-        if eos_token_id_tensor is not None:
-            unfinished_sequences = unfinished_sequences.mul(
-                next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(
-                    eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
-            )
+        unfinished_sequences = unfinished_sequences.mul(
+            next_tokens.tile(eos_token_id_tensor.shape[0], 1).ne(
+                eos_token_id_tensor.unsqueeze(1)).prod(dim=0)
+        )
 
-            # stop when each sentence is finished
-            if unfinished_sequences.max() == 0:
-                break
+        # stop when each sentence is finished
+        if unfinished_sequences.max() == 0:
+            break
 
         # # stop if we exceed the maximum length
         cur_len = input_ids.shape[-1]
         is_done = cur_len >= max_length
         if is_done:
             break
+
     return input_ids
 
 
@@ -349,7 +333,13 @@ def model_as_fn(
 
 
 inputs = tokenizer(question, return_tensors="pt", padding=True).to(0)
-outputs = generate(inputs=inputs, model=model,
-                   model_as_fn=model_as_fn, max_length=24, **inputs)
+outputs = generate(
+    input_ids = inputs.input_ids,
+    max_length = 24,
+    attention_mask = inputs.attention_mask,
+    use_cache = True,
+    model_as_fn = model_as_fn,
+    model = model,
+)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 print(tokenizer.decode(outputs[1], skip_special_tokens=True))

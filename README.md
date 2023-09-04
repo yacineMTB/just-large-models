@@ -6,6 +6,9 @@ Every model should have its own runnable logic. Seperate. Not shared! Each file 
 ## Rules:
 - The code is the tool. Edit it as you see fit!
 - I will not be addressing issues
+- Not a single kwargs shall 
+- Every edit shall increase progresss towards removing the huggingface dependency
+- One model forward pass = one function call. Simple as.
 
 ## Current models
 ```
