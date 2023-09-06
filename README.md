@@ -7,7 +7,7 @@ This is designed to rely on HF for the files, and loading of the files. Otherwis
 
 ## Rules:
 - The code is the tool. Edit it as you see fit!
-- All h*ggingface imports will be placed in quarantine. Model pass files will contain no references to h*gginface
+- All h*ggingface imports will be placed in quarantine. Model pass files will contain no references
 - I will not be addressing issues
 - Not a single kwargs shall be observed
 - One model forward pass = one function call. Simple as.
