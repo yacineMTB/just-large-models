@@ -1,57 +1,19 @@
 # Why? I got a little annoyed w/ huggingface's.. code. So I ripped it out and fixed some over abstraction
 # The end goal is to remove all dependencies from huggingface.
-# Still not completely unfucked!
 
 # Attribution:
 # Most of this code has been ripped out of huggingface, with great pain
 # Shout out to kaparthy's GPT & makemore series. Helped a lot
 # Shout out to llama implementation from meta
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" PyTorch LLaMA model."""
 
 import torch
 import math
+from box import Box # Forgive me
 from torch import nn
-from transformers import LlamaTokenizer, LlamaForCausalLM
-from transformers import BitsAndBytesConfig
+from torch.nn.functional import silu
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-model_id = "/home/kache/models/llama2/7bhf/model"
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
-)
-tokenizer = LlamaTokenizer.from_pretrained(
-    "/home/kache/models/llama2/7bhf/tokenizer", legacy=True)
-model = LlamaForCausalLM.from_pretrained(
-    "/home/kache/models/llama2/7bhf/model", device_map={"": 0},  quantization_config=bnb_config)
-print(model)
-
-question = [
-    "I went to the store the other day",
-    "For what its worth, I really dont think that you should"
-]
-tokenizer.pad_token = tokenizer.eos_token
-
+from quarantine.load import load_hf_llama_state_dict, load_sterilized_hf_llama_tokenizer
 
 def generate(
     input_ids = None,
@@ -59,12 +21,10 @@ def generate(
     attention_mask = None,
     use_cache = None,
     model_as_fn = None,
-    model = None,
+    model_state_dict = None,
+    pad_token_id = None,
+    eos_token_id = None,
 ):
-    generation_config = model.generation_config
-
-    pad_token_id = generation_config.pad_token_id
-    eos_token_id = generation_config.eos_token_id
     eos_token_id_tensor = torch.tensor([eos_token_id]).to(input_ids.device)
 
     # We want to mark sequences that are finished
@@ -75,7 +35,7 @@ def generate(
     position_ids = None
 
     while True:
-        # todo: This used to be worse, but its still bad. continue unfucking
+        # todo: This used to be worse, but its still bad. continue healing
         if past_key_values:
             inference_state = {"input_ids": input_ids[:, -1:]}
         else:
@@ -92,13 +52,13 @@ def generate(
             {
                 "position_ids": position_ids,
                 "past_key_values": past_key_values,
-                "use_cache": True,
+                "use_cache": use_cache,
                 "attention_mask": attention_mask,
             }
         )
 
         outputs = model_as_fn(
-            model,
+            model_state_dict,
             input_ids = inference_state['input_ids'],
             position_ids = inference_state['position_ids'],
             past_key_values = inference_state['past_key_values'],
@@ -138,6 +98,33 @@ def generate(
 
     return input_ids
 
+def get_total_layers(model_state_dict):
+    layer_keys = [key for key in model_state_dict.keys() if "model.layers." in key]
+    layer_numbers = set([int(key.split('.')[2]) for key in layer_keys])
+    total_layers = max(layer_numbers) + 1
+    return total_layers
+
+def get_layer_weights(layer_number, model_state_dict):
+    layer_key = f"model.layers.{layer_number}"
+    weights = {
+        "self_attn": {
+            "q_proj": model_state_dict[f"{layer_key}.self_attn.q_proj.weight"],
+            "k_proj": model_state_dict[f"{layer_key}.self_attn.k_proj.weight"],
+            "v_proj": model_state_dict[f"{layer_key}.self_attn.v_proj.weight"],
+            "o_proj": model_state_dict[f"{layer_key}.self_attn.o_proj.weight"],
+        },
+        "mlp": {
+            "gate_proj": model_state_dict[f"{layer_key}.mlp.gate_proj.weight"],
+            "up_proj": model_state_dict[f"{layer_key}.mlp.up_proj.weight"],
+            "down_proj": model_state_dict[f"{layer_key}.mlp.down_proj.weight"],
+        },
+        "input_layernorm": model_state_dict[f"{layer_key}.input_layernorm.weight"],
+        "post_attention_layernorm": model_state_dict[f"{layer_key}.post_attention_layernorm.weight"]
+    }
+
+    ret = Box(weights)
+    return ret
+
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     def rotate_half(x):
@@ -155,9 +142,15 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
     return q_embed, k_embed
 
+def rmsnorm(weights, hidden_states, rms_norm_epsilon=1e-05):
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + rms_norm_epsilon)
+    return weights * hidden_states.to(input_dtype)
 
 def model_as_fn(
-    model,
+    model_state_dict,
     input_ids,
     position_ids,
     past_key_values,
@@ -169,8 +162,8 @@ def model_as_fn(
     past_key_values_length = past_key_values[0][0].shape[2] if past_key_values else 0
     sequence_length_with_past += past_key_values_length if past_key_values else 0
 
-    # Word embedding
-    hidden_states = model.model.embed_tokens(input_ids)
+    embedding_layer = nn.Embedding.from_pretrained(model_state_dict["model.embed_tokens.weight"])
+    hidden_states = embedding_layer(input_ids)
 
     # Attention mask
     def prepare_attention_mask(attention_mask, input_shape, input_embeds, past_key_values_length):
@@ -205,34 +198,34 @@ def model_as_fn(
 
     next_decoder_cache = () if use_cache else None
 
-    for i, decoder_layer in enumerate(model.model.layers):
+    total_layers = get_total_layers(model_state_dict)
+    for i in range(total_layers):
+        decoder_layer = get_layer_weights(i, model_state_dict)
         past_key_value = past_key_values[i] if past_key_values is not None else None
         residual = hidden_states
-
-        def rmsnorm(model, hidden_states):
-            input_dtype = hidden_states.dtype
-            hidden_states = hidden_states.to(torch.float32)
-            variance = hidden_states.pow(2).mean(-1, keepdim=True)
-            hidden_states = hidden_states * \
-                torch.rsqrt(variance + model.variance_epsilon)
-            return model.weight * hidden_states.to(input_dtype)
-
         hidden_states = rmsnorm(decoder_layer.input_layernorm, hidden_states)
 
         # Self Attention
-
         def self_attn(
-            model,
+            layer_weights,
             hidden_states,
             attention_mask,
             position_ids,
             past_key_value,
             use_cache,
+            num_key_value_heads=32,
+            num_attention_heads=32,
+            hidden_size=4096,
+            max_position_embeddings=4096,
+            rope_theta=10000
         ):
+            head_dim = hidden_size // num_attention_heads
             def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                 """
                 This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
                 num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+                # so why is it differetnt?
+                # TODO: understand and avoid ugly
                 """
                 batch, num_key_value_heads, slen, head_dim = hidden_states.shape
                 if n_rep == 1:
@@ -241,22 +234,41 @@ def model_as_fn(
                 return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
             B, q_len, _ = hidden_states.size()
-            query_states = model.q_proj(hidden_states)
-            key_states = model.k_proj(hidden_states)
-            value_states = model.v_proj(hidden_states)
+            query_states = hidden_states @ layer_weights.q_proj.T
+            key_states = hidden_states @ layer_weights.k_proj.T
+            value_states = hidden_states @ layer_weights.v_proj.T
 
             query_states = query_states.view(
-                B, q_len, model.num_heads, model.head_dim).transpose(1, 2)
+                B, q_len, num_attention_heads, head_dim).transpose(1, 2)
             key_states = key_states.view(
-                B, q_len, model.num_key_value_heads, model.head_dim).transpose(1, 2)
+                B, q_len, num_key_value_heads, head_dim).transpose(1, 2)
             value_states = value_states.view(
-                B, q_len, model.num_key_value_heads, model.head_dim).transpose(1, 2)
+                B, q_len, num_key_value_heads, head_dim).transpose(1, 2)
 
             kv_seq_len = key_states.shape[-2]
             if past_key_value is not None:
                 kv_seq_len += past_key_value[0].shape[-2]
 
-            cos, sin = model.rotary_emb(value_states, seq_len=kv_seq_len)
+            def get_rotary_embedding(value_states, dim, seq_len, max_position_embeddings, device, base=10000):
+                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+                t = torch.arange(max_position_embeddings, device=device, dtype=inv_freq.dtype)
+                freqs = torch.einsum("i,j->ij", t, inv_freq)
+                emb = torch.cat((freqs, freqs), dim=-1)
+                # TODO: Avoid recomputing somehow
+                # How much faster is it *really*?
+                cos = emb.cos()[None, None, :, :].to(inv_freq.dtype)
+                sin = emb.sin()[None, None, :, :].to(inv_freq.dtype)
+                return cos[:, :, :seq_len, ...].to(dtype=value_states.dtype), sin[:, :, :seq_len, ...].to(dtype=value_states.dtype)
+
+            cos, sin = get_rotary_embedding(
+                value_states,
+                head_dim,
+                max_position_embeddings=max_position_embeddings,
+                base=rope_theta,
+                device=input_ids.device,
+                seq_len=kv_seq_len
+            )
+
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, position_ids)
 
@@ -268,24 +280,26 @@ def model_as_fn(
 
             past_key_value = (key_states, value_states) if use_cache else None
 
-            # repeat k/v heads if n_kv_heads < n_heads
-            key_states = repeat_kv(key_states, model.num_key_value_groups)
-            value_states = repeat_kv(value_states, model.num_key_value_groups)
+            num_key_value_groups = num_attention_heads // num_key_value_heads
+            # Should be nil op in the case of 7b
+            key_states = repeat_kv(key_states, num_key_value_groups)
+            value_states = repeat_kv(value_states, num_key_value_groups)
             attn_weights = torch.matmul(
-                query_states, key_states.transpose(2, 3)) / math.sqrt(model.head_dim)
+                query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask
 
             # upcast attention to fp32
+            # TODO: Why? Not sure why! I cargo'd from huggingface
             attn_weights = nn.functional.softmax(
                 attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_output = torch.matmul(attn_weights, value_states)
 
             attn_output = attn_output.transpose(1, 2).contiguous()
-            attn_output = attn_output.reshape(B, q_len, model.hidden_size)
+            attn_output = attn_output.reshape(B, q_len, hidden_size)
 
-            attn_output = model.o_proj(attn_output)
+            attn_output = attn_output @ layer_weights.o_proj.T
 
             return attn_output, past_key_value
 
@@ -299,17 +313,17 @@ def model_as_fn(
         )
 
         hidden_states = residual + hidden_states
-
-        # Fully Connected
         residual = hidden_states
-        hidden_states = decoder_layer.post_attention_layernorm(hidden_states)
+        hidden_states = rmsnorm(decoder_layer.post_attention_layernorm, hidden_states)
 
-        def mlp(model, x):
-            down_proj = model.down_proj(model.act_fn(
-                model.gate_proj(x)) * model.up_proj(x))
-            return down_proj
+        def mlp_new(layer_weights, x):
+            up_proj_output = x @ layer_weights.up_proj.T
+            gate_proj_output = x @ layer_weights.gate_proj.T
+            down_proj_input = silu(gate_proj_output) * up_proj_output
+            down_proj_output = down_proj_input @ layer_weights.down_proj.T
+            return down_proj_output
 
-        hidden_states = mlp(decoder_layer.mlp, hidden_states)
+        hidden_states = mlp_new(decoder_layer.mlp, hidden_states)
         hidden_states = residual + hidden_states
         layer_outputs = (hidden_states,)
 
@@ -322,24 +336,36 @@ def model_as_fn(
             next_decoder_cache += (
                 layer_outputs[1],)
 
-    hidden_states = model.model.norm(hidden_states)
-    logits = model.lm_head(hidden_states)
-    logits = logits.float()
+    norm_weights = model_state_dict["model.norm.weight"]
+    lm_head_weights = model_state_dict["lm_head.weight"]
+    hidden_states = rmsnorm(norm_weights, hidden_states)
+
+    logits = hidden_states @ lm_head_weights.T
 
     return CausalLMOutputWithPast(
         logits=logits,
         past_key_values=next_decoder_cache,
     )
 
+model_path = "/home/kache/models/llama2/7bhf/model"
+tokenizer_path = "/home/kache/models/llama2/7bhf/tokenizer"
+tokenizer = load_sterilized_hf_llama_tokenizer(tokenizer_path)
+model_state_dict = load_hf_llama_state_dict(model_path)
 
-inputs = tokenizer(question, return_tensors="pt", padding=True).to(0)
+prompts = [
+    "I went to the store the other day",
+    "For what its worth, I really dont think that you should"
+]
+inputs, attention_mask = tokenizer.encode(prompts)
 outputs = generate(
-    input_ids = inputs.input_ids,
-    max_length = 24,
-    attention_mask = inputs.attention_mask,
+    input_ids = inputs,
+    max_length = 100,
+    attention_mask = attention_mask,
     use_cache = True,
     model_as_fn = model_as_fn,
-    model = model,
+    model_state_dict = model_state_dict,
+    eos_token_id=tokenizer.eos_token,
+    pad_token_id=tokenizer.pad_token,
 )
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 print(tokenizer.decode(outputs[1], skip_special_tokens=True))
